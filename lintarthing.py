@@ -52,6 +52,8 @@ class Packet():
 class GuitarStatus():
     def __init__(self):
         self.inputs = {}
+        self.tilt_min = {"x": 100, "y": 130}
+        self.tilt_max = {"x": 130, "y": 100}
         self.inputs["strum_down"] = False
         self.inputs["strum_up"] = False
         self.inputs["green"] = False
@@ -62,6 +64,8 @@ class GuitarStatus():
         self.inputs["plus"] = False
         self.inputs["minus"] = False
         self.inputs["whammy_bar"] = 0
+        self.whammy_min = 15
+        self.whammy_max = 16
         self.guitarConnected = False
 
     def handle_status_report(self, packet_bytes, wiimote, was_requested):
@@ -72,7 +76,7 @@ class GuitarStatus():
         print("Battery at " + str(floor(battery_percentage * 100) / 100) + "%")
         
         if not was_requested:
-            wiimote.set_reporting_mode(False, 0x32)
+            wiimote.set_reporting_mode(False, 0x35)
             flags = packet_bytes[3]
             if not (flags & 0x02) and self.guitarConnected:
                 led_num = 1 if (flags >> 4 == 1) else 2 if (flags >> 5 == 1) else 3 if (flags >> 6 == 1) else 4
@@ -92,11 +96,37 @@ class GuitarStatus():
     def getSpamButtons(self, packet):
         return packet.packet_bytes[2] == 3
 
+    def getTilt(self, packet):
+        packet_bytes = packet.packet_bytes
+        # Calibrate Tilt
+        xb, yb = [packet_bytes[3], packet_bytes[4]]
+
+
+        if packet_bytes[2] == 2:
+            self.tilt_min={"x": int(xb), "y": int(yb)}
+            #print("Min Tilt: ", end='')
+            #print(f"X: {int(xb)}, y: {int(yb)}")
+        elif packet_bytes[2] == 1:
+            self.tilt_max={"x": int(xb), "y": int(yb)}
+            #print("Max Tilt Set")
+            #print(f"X: {int(xb)}, y: {int(yb)}")
+        x_val = int(xb) - 128
+        y_val = int(yb) - 128
+        percent_x = (x_val - (self.tilt_min["x"] - 128)) / (self.tilt_max["x"] - self.tilt_min["x"])
+        percent_y = (y_val - (self.tilt_min["y"] - 128)) / (self.tilt_max["y"] - self.tilt_min["y"])
+
+        total_tilt = -(percent_x + percent_y) / 2
+        
+        #print(f'Tilt X: {floor(percent_x * 100000) / 1000}%, Tilt Y: {floor(percent_y * 100000) / 1000}%')
+        #print(f'Total Tilt: {floor((total_tilt) * 100000) / 1000}%')
+        return total_tilt
+
     def update(self, packet, wiimote):
         packet_bytes = packet.packet_bytes
         
         packet_id = packet_bytes[0]
         btn_bytes = []
+        whammy_byte = None
 
         if packet_id == 0x20:
             self.handle_status_report(packet_bytes, wiimote, False)
@@ -111,22 +141,30 @@ class GuitarStatus():
             return set()
         
         elif packet_id == 0x31:
+            tilt = self.getTilt(packet)
             return set()
 
         elif packet_id == 0x32 or packet_id == 0x34:
             btn_bytes = [packet_bytes[7], packet_bytes[8]]
+            whammy_byte = packet_bytes[6]
         
         elif packet_id == 0x35:
             btn_bytes = [packet_bytes[10], packet_bytes[11]]
+            whammy_byte = packet_bytes[9]
+            tilt = self.getTilt(packet)
 
         elif packet_id == 0x36:
             btn_bytes = [packet_bytes[17], packet_bytes[18]]
+            whammy_byte = packet_bytes[16]
 
         elif packet_id == 0x37:
             btn_bytes = [packet_bytes[20], packet_bytes[21]]
+            whammy_byte = packet_bytes[19]
+            tilt = self.getTilt(packet)
 
         elif packet_id == 0x3d:
             btn_bytes = [packet_bytes[5], packet_bytes[6]]
+            whammy_byte = packet_bytes[4]
 
         else:
             raise Exception(f"Packet type {hex(packet_id)} is not parsable")
@@ -144,6 +182,13 @@ class GuitarStatus():
         self.inputs["yellow"]     = not (btn_bytes[1] & btn_map.yellow)
         self.inputs["blue"]       = not (btn_bytes[1] & btn_map.blue)
         self.inputs["orange"]     = not (btn_bytes[1] & btn_map.orange)
+
+        if whammy_byte < self.whammy_min: self.whammy_min = whammy_byte
+        if whammy_byte > self.whammy_max: self.whammy_max = whammy_byte
+        calibrated_whammy = (int(whammy_byte) - self.whammy_min) / (self.whammy_max - self.whammy_min)
+
+        self.inputs["whammy_bar"] = calibrated_whammy
+        self.inputs["tilt"] = tilt
 
         new_state = set(self.inputs.items())
 
@@ -256,7 +301,7 @@ def main():
     ret = wiimote.read_register(0xa400fa, 6)
     print(ret)
 
-    ret = wiimote.set_reporting_mode(False, 0x32)
+    ret = wiimote.set_reporting_mode(False, 0x35)
     print(ret)
 
     status = GuitarStatus()
@@ -283,6 +328,16 @@ def main():
                 controller.emit(binds[key[0]], -1 * key[1])
             elif key[0] == 'strum_down':
                 controller.emit(binds[key[0]], 1 * key[1])
+            elif key[0] == 'tilt':
+                tilt = int(key[1] * ABS_MAX_VAL)
+                #print("Tilt: " + str(key[1]))
+                controller.emit(binds[key[0]], tilt)
+                pass
+            elif key[0] == 'whammy_bar':
+                mapped_val = int(key[1] * ABS_MAX_VAL) # map the value from 0-31 to 0-ABS_MAX_VAL
+                controller.emit(binds[key[0]], mapped_val)
+            else:
+                controller.emit(binds[key[0]], key[1])
 
 if __name__ == "__main__":
     main()
