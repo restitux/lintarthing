@@ -94,7 +94,7 @@ class GuitarStatus():
                 print("Guitar Hero Guitar Detected")
 
     def getSpamButtons(self, packet):
-        return packet.packet_bytes[2] == 3
+        return (packet.packet_bytes[2] & 0x08) > 0 # 0x08 corresponds to the A button
 
     def getTilt(self, packet):
         packet_bytes = packet.packet_bytes
