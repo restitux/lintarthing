@@ -64,6 +64,7 @@ class GuitarStatus():
         self.inputs["plus"] = False
         self.inputs["minus"] = False
         self.inputs["whammy_bar"] = 0
+        self.inputs["tilt"] = 0
         self.whammy_min = 15
         self.whammy_max = 16
         self.guitarConnected = False
@@ -127,7 +128,8 @@ class GuitarStatus():
         packet_id = packet_bytes[0]
         btn_bytes = []
         whammy_byte = None
-
+        tilt = self.inputs["tilt"]
+        
         if packet_id == 0x20:
             self.handle_status_report(packet_bytes, wiimote, False)
             return set()
