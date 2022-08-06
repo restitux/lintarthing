@@ -1,13 +1,13 @@
 #include <iostream>
-#include <hidapi/hidapi.h>
-#include <cwchar>
-#include <time.h>
-#include <signal.h>
-#include <vector>
-#include <optional>
-#include <fcntl.h>
 #include <linux/input.h>
 #include <linux/uinput.h>
+#include <hidapi/hidapi.h>
+#include <time.h>
+#include <cmath>
+#include <vector>
+#include <sys/wait.h>
+#include <signal.h>
+#include <fcntl.h>
 
 #define __STDC_WANT_LIB_EXT1__ 1
 
@@ -18,12 +18,18 @@
 
 struct input_diff {
     int id;
-    std::optional<float> val_float;
-    std::optional<int> val_int;
-    std::optional<bool> val_bool;
+    float val_float = 0;
+    int val_int = 0;
+    bool val_bool = false;
 };
 
 // The index is the button id, the value is the uinput id
+const char *uinput_strmap[11] {
+    "Green", "Red", "Yellow", "Blue",
+    "Orange", "Strum Down", "Strum Up",
+    "Plus", "Star Power", "Whammy", "Tilt"
+};
+
 const int uinput_map[11] = {
     BTN_A, BTN_B, BTN_Y, BTN_X,
     BTN_TL, ABS_HAT0Y, ABS_HAT0Y,
@@ -48,12 +54,12 @@ struct input_obj {
 
     float whammy_bar = 0;       // ABS_RX
     int whammy_min = 15;
-    int whammy_max = 16;
+    int whammy_max = 26;
     
     float tilt = 0;           // ABS_RY
     // TODO: Change out with better values
-    uint8_t tilt_min[2] = {100, 130};
-    uint8_t tilt_max[2] = {130, 100};
+    float tilt_min = 0;
+    float tilt_max = 90;
 
     bool &get_button_state(int id) {
         switch (id)
@@ -103,6 +109,8 @@ struct Guitar_Map {
     const uint8_t orange     = 0x80;
 } guitar_map;
 
+int child_id;
+
 class Wiimote
 {
     private:
@@ -111,7 +119,6 @@ class Wiimote
         Wiimote(hid_device *device)
         {
             _device = device;
-            std::cout << device << std::endl;
         }
 
     void read_packet(unsigned char *data)
@@ -135,6 +142,40 @@ class Wiimote
         unsigned char *temp = (unsigned char *) new unsigned char(22);
         read_packet(temp);
         delete temp;
+    }
+
+    void read_calibration_offsets(uint8_t zero_offs[3], uint8_t grav_offs[3])
+    {
+        uint8_t first_addr = 0x16;
+        uint8_t packet[7] = {0x00};
+
+        packet[0] = 0x17;
+        packet[4] = first_addr;
+        packet[6] = 0x0A;
+        hid_write(_device, packet, 7);
+        uint8_t calibration_data[22] = {0x00};
+        while (calibration_data[0] != 0x21 && calibration_data[5] != 0x16) {
+            read_packet(calibration_data);
+        }
+        printf("[CHILD %i]: Calibration Data @ 0x%02hhx: ", child_id, first_addr);
+
+        for (int i = 0; i < 22; i++)
+        {
+            printf("%02x ", calibration_data[i]);
+        }
+        puts("\n");
+
+        zero_offs[0] = calibration_data[6];
+        zero_offs[1] = calibration_data[7];
+        zero_offs[2] = calibration_data[8];
+
+        grav_offs[0] = calibration_data[10];
+        grav_offs[1] = calibration_data[11];
+        grav_offs[2] = calibration_data[12];
+
+        printf("[CHILD %i]: 0G X: %02hhx | 1G X: %02hhx\n", child_id, zero_offs[0], grav_offs[0]);
+        printf("[CHILD %i]: 0G Y: %02hhx | 1G Y: %02hhx\n", child_id, zero_offs[1], grav_offs[1]);
+        printf("[CHILD %i]: 0G Z: %02hhx | 1G Z: %02hhx\n", child_id, zero_offs[2], grav_offs[2]);
     }
 
     void write_register(unsigned int address, unsigned char *data, uint8_t length)
@@ -165,12 +206,30 @@ class Guitar_Status
 {
     private:
         input_obj _inputs;
+        uint8_t x_zero = 0x80;
+        uint8_t y_zero = 0x80;
+        uint8_t z_zero = 0x80;
+
+        uint8_t x_grav = 0x90;
+        uint8_t y_grav = 0x90;
+        uint8_t z_grav = 0x90;
     public:
         Guitar_Status(input_obj inputs)
         {
             _inputs = inputs;
         }
     
+    void set_calibration_offsets(uint8_t zero_offs[3], uint8_t grav_offs[3])
+    {
+        x_zero = zero_offs[0];
+        y_zero = zero_offs[1];
+        z_zero = zero_offs[2];
+
+        x_grav = grav_offs[0];
+        y_grav = grav_offs[1];
+        z_grav = grav_offs[2];
+    }
+
     void handle_read_report(const unsigned char *packet)
     {
         // This is the extension identifying itself
@@ -198,6 +257,7 @@ class Guitar_Status
         // https://wiibrew.org/wiki/Wiimote/Protocol#Status_Reporting
 
         float battery_percentage = ((float) packet[6] / 255) * 200;
+        printf("Battery input: %u\n", packet[6]);
         printf("Battery at %f%\n", battery_percentage);
         
         if (!was_requested)
@@ -213,40 +273,45 @@ class Guitar_Status
         }
     }
 
-    bool getSpamButtons(const unsigned char *packet)
+    bool get_spam_buttons(const unsigned char *packet)
     {
         return (packet[2] & 0x08) > 0; // 0x08 corresponds to the A button
     }
 
-    float getTilt(const unsigned char *packet)
+    float get_tilt(const unsigned char *packet)
     {
         // Calibrate Tilt
         unsigned char xb = packet[3];
         unsigned char yb = packet[4];
+        unsigned char zb = packet[5];
 
+        float cal_x = (float)(xb - x_zero) / (x_grav - x_zero);
+        float cal_y = -(float)(yb - y_zero) / (y_grav - y_zero); //The top side of the remote is -y, so we invert the value
+        float cal_z = (float)(zb - z_zero) / (z_grav - z_zero);
+
+        // This is an escape sequence that clears the terminal and resets the cursor position
+        // std::cout << "\x1b[2J\x1b[;H";
+        // printf("Raw Values:  X:   0x%02hhx |   Y: 0x%02hhx | Z:   0x%02hhx\n", xb, yb, zb);
+        // printf("Raw Decimal: X: %6hhu | Y: %6hhu | Z: %6hhu\n", xb, yb, zb);
+        // printf("New Decimal: X: %6.03f | Y: %6.03f | Z: %6.03f\n", cal_x, cal_y, cal_z);
+        float magnitude = std::sqrt(pow(cal_z, 2) + pow(cal_x, 2));
+        float angle = std::atan(cal_y / magnitude) * 180/M_PI; // multiply by 180/pi to convert from radians to degrees
+        // printf("\nMagnitude:  %.03f\n", magnitude);
+        // printf("Angle (radians): %.03f\n", angle);
+        // printf("Angle (degrees): %.03f\n", angle * (180/M_PI));
 
         if (packet[2] & 0x02)
         {
-            _inputs.tilt_min[0] = xb;
-            _inputs.tilt_min[1] = yb;
+            _inputs.tilt_min = angle;
             //printf("Min Tilt: X: %u, Y: %u\n", xb, yb);
         }
         else if (packet[2] & 0x01)
         {
-            _inputs.tilt_max[0] = xb;
-            _inputs.tilt_max[1] = yb;
+            _inputs.tilt_max = angle;
             //printf("Max Tilt: X: %u, Y: %u\n", xb, yb);
         }
-        int8_t x_val = xb - 128;
-        int8_t y_val = yb - 128;
-        float percent_x = (x_val - (_inputs.tilt_min[0] - 128) * 1.0) / (_inputs.tilt_max[0] - _inputs.tilt_min[0] * 1.0);
-        float percent_y = (y_val - (_inputs.tilt_min[1] - 128) * 1.0) / (_inputs.tilt_max[1] - _inputs.tilt_min[1] * 1.0);
-
-        float total_tilt = -(percent_x + percent_y) / 2;
         
-        //printf("Tilt X: %.2f, Tilt Y: %.2f", percent_x * 100, percent_y * 100);
-        //printf("Total Tilt: %.2f", total_tilt * 100);
-        return total_tilt;
+        return (angle - _inputs.tilt_min) / (_inputs.tilt_max - _inputs.tilt_min);
     }
     
     void update(const unsigned char *packet, std::vector<input_diff> &data, Wiimote *wiimote)
@@ -269,7 +334,7 @@ class Guitar_Status
             case 0x30:
                 return;
             case 0x31:
-                tilt = getTilt(packet);
+                tilt = get_tilt(packet);
                 return;
             case 0x32:
             case 0x34:
@@ -281,7 +346,7 @@ class Guitar_Status
                 whammy_byte = packet[9];
                 btn_bytes[0] = packet[10];
                 btn_bytes[1] = packet[11];
-                tilt = getTilt(packet);
+                tilt = get_tilt(packet);
                 break;
             case 0x36:
                 whammy_byte = packet[16];
@@ -292,7 +357,7 @@ class Guitar_Status
                 whammy_byte = packet[19];
                 btn_bytes[0] = packet[20];
                 btn_bytes[1] = packet[21];
-                tilt = getTilt(packet);
+                tilt = get_tilt(packet);
                 break;
             case 0x3d:
                 whammy_byte = packet[4];
@@ -300,7 +365,7 @@ class Guitar_Status
                 btn_bytes[1] = packet[6];
                 break;
             default:
-                printf("Cannot parse packet type %hhx.", packet_id);
+                printf("Cannot parse packet type 0x%hhx.", packet_id);
                 return;
         }
 
@@ -325,14 +390,6 @@ class Guitar_Status
 
         _inputs.whammy_bar = calibrated_whammy;
         _inputs.tilt = tilt;
-
-        // std::cout << "Previous State: ";
-        // std::cout << "Green: " << (_inputs.green ? u8"\u2713" : "x");
-        // std::cout << ", Red: " << (_inputs.red ? u8"\u2713" : "x");
-        // std::cout << ", Yellow: " << (_inputs.yellow ? u8"\u2713" : "x");
-        // std::cout << ", Blue: " << (_inputs.blue ? u8"\u2713" : "x");
-        // std::cout << ", Orange: " << (_inputs.orange ? u8"\u2713" : "x");
-        // std::cout << std::endl;
         
         input_diff temp;
         for (int i = 0; i < _inputs.num_buttons; i++)
@@ -360,12 +417,16 @@ class Guitar_Status
     }
 };
 
-void set_axis_values(uinput_user_dev &uidev, int axis, int min, int max, int flat, int fuzz)
+int set_axis_values(int fd, short axis, int min, int max, int flat, int fuzz)
 {
-    uidev.absmin[axis] = min;
-    uidev.absmax[axis] = max;
-    uidev.absflat[axis] = flat;
-    uidev.absfuzz[axis] = fuzz;
+    struct uinput_abs_setup axis_setup;
+    axis_setup.code = axis;
+    axis_setup.absinfo.minimum = min;
+    axis_setup.absinfo.maximum = max;
+    axis_setup.absinfo.flat = flat;
+    axis_setup.absinfo.fuzz = fuzz;
+    axis_setup.absinfo.resolution = max;
+    return ioctl(fd, UI_ABS_SETUP, &axis_setup);
 }
 
 int emit(int fd, int ev_type, int ev_code, int value)
@@ -389,73 +450,76 @@ int dev_sync(int fd)
 }
 
 int fd;
+pid_t *child_pids;
+int num_devices = 0;
 
 void exit_handler(int s)
 {
-    printf("\n\nDetected Interrupt Signal: %d\nCleaning up HID & UInput devices\n", s);
+    printf("\n\n[CHILD %i]: Detected shutdown signal. Cleaning up HID & UInput device\n", child_id);
     ioctl(fd, UI_DEV_DESTROY);
     close(fd);
     hid_exit();
     exit(0);
 }
 
-int main() {
-    hid_init();
+void terminate_children(int s)
+{
+    puts("\n\n[PARENT]: Detected shutdown signal. Terminating child process(es).");
+    for (int i = 0; i < num_devices; i++)
+    {
+        kill(child_pids[i], SIGUSR1);
+    }
+}
 
-    // handling ctrl+c to shutdown properly
-    struct sigaction sigIntHandler;
 
-    sigIntHandler.sa_handler = exit_handler;
-    sigemptyset(&sigIntHandler.sa_mask);
-    sigIntHandler.sa_flags = 0;
+void child_exec(int id, char *device_path)
+{
+    child_id = id;
+    hid_device *hid_dev;
+    Wiimote    *wiimote;
+    uint8_t    zero_offs[3];
+    uint8_t    grav_offs[3];
 
-    sigaction(SIGINT, &sigIntHandler, NULL);
+    // Open the wiimote's HID device and initialize the Wiimote class
 
-    // initializing the HID devices (a.k.a the wiimotes)
-    hid_device_info *devices = hid_enumerate(0x057e, 0x0306);
-
-    int num_devices = 0;
-    hid_device_info *dev = devices;
-    while (dev) {
-        num_devices++;
-        dev = dev->next;
+    hid_dev = hid_open_path(device_path);
+    if (!hid_dev) {
+        printf("[CHILD %i]: Error: failed to open HID device at %s. Do you have read/write access to device files?\n", child_id, device_path);
+        return;
     }
 
-    if (num_devices < 1) return 0;
-    hid_device *open_dev = hid_open_path(devices->path);
-    if (!open_dev) {
-        printf("Error: failed to open HID device located at %s. Do you have read/write access to device files?\n", devices->path);
-        return 1;
-    }
+    wiimote = new Wiimote(hid_dev);
     
-    hid_free_enumeration(devices);
-
-    Wiimote *wiimote = new Wiimote(open_dev);
+    // This unencrypts the traffic from the extension
+    // TODO: Do this every time a guitar extension is plugged in
     wiimote->write_register(0xa400f0, (unsigned char *) new unsigned char(0x55), 1);
     wiimote->write_register(0xa400fb, (unsigned char *) new unsigned char(0x00), 1);
+    
+    // Initialize controller input communication
     wiimote->set_reporting_mode(false, 0x35);
+    //TODO: Allow end user to set their player LED or do it automatically
+    wiimote->set_active_leds();
+    wiimote->read_calibration_offsets(zero_offs, grav_offs);
 
-    // UINPUT---------------------------------------------------------------------
+    // UInput setup --------------------------------------------------------------------------------
 
-    struct uinput_user_dev uidev;
+    struct uinput_setup usetup;
     struct input_event ev;
-
-    // This creates our virtual device
-    // each time the file is opened, it returns a unique file descriptor
-    // which will allow us to create and use multiple devices at a time
-    fd = open("/dev/uinput", O_WRONLY | O_NONBLOCK);
-
-    if (fd < 0)
-    {
-        perror("error: couldn't open uinput file");
-        exit(1);
-    }
+    
+    // These two arrays store the input capabilities of our
+    // virtual uinput controllers
 
     const int num_btns = 11;
     const int btn_inputs[num_btns] = {
         BTN_A, BTN_B, BTN_Y, BTN_X,
         BTN_SELECT, BTN_START, BTN_MODE,
         BTN_TL, BTN_TR, BTN_THUMBL, BTN_THUMBR
+    };
+
+    const char *btn_names[num_btns] = {
+        "BTN_A", "BTN_B", "BTN_Y", "BTN_X",
+        "BTN_SELECT", "BTN_START", "BTN_MODE",
+        "BTN_TL", "BTN_TR", "BTN_THUMBL", "BTN_THUMBR"
     };
 
     const int num_abs = 8;
@@ -465,86 +529,108 @@ int main() {
         ABS_Z, ABS_RZ
     };
 
-    ioctl(fd, UI_SET_EVBIT, EV_ABS);
-    ioctl(fd, UI_SET_EVBIT, EV_KEY);
-    
-    memset(&uidev, 0, sizeof(uidev));
-    snprintf(uidev.name, UINPUT_MAX_NAME_SIZE, "Xbox 360 Controller");
+    const char *abs_names[num_abs] = {
+        "ABS_HAT0X", "ABS_HAT0Y",
+        "ABS_X", "ABS_Y", "ABS_RX", "ABS_RY",
+        "ABS_Z", "ABS_RZ"
+    };
 
-    uidev.id.bustype = BUS_USB;
-    uidev.id.version = 1;
-    uidev.id.vendor = 0x045E; // VID Microsoft Corp.
-    uidev.id.product = 0x028e; // PID Xbox360 Controller
+    // Clear out any garbage data
+    memset(&usetup, 0, sizeof(usetup));
+
+    // Set virtual controller identification values
+    strcpy(usetup.name, "Xbox 360 Controller");
+    usetup.id.bustype = BUS_USB;
+    usetup.id.version = 1;
+    usetup.id.vendor = 0x045E; // VID of Microsoft Corp.
+    usetup.id.product = 0x028E; // PID for Xbox360 Controller
     // Alternate PIDs: 0x028F (Xbox360 Wireless Controller),
     // 0x02D1 (Xbox One Controller),
     // 0x02DD (Xbox One Controller (Firmware 2015)),
     // 0x02E3 Xbox One Elite Controller,
     // 0x0B12 (Xbox Wireless Controller (model 1914))
 
+    fd = open("/dev/uinput", O_WRONLY | O_NONBLOCK);
+    if (fd < 0)
+    {
+        printf("[CHILD %i]: Error: couldn't open uinput file", child_id);
+        exit(1);
+    }
+
+    // Enabling all controller inputs
+
+    ioctl(fd, UI_SET_EVBIT, EV_ABS);
+    ioctl(fd, UI_SET_EVBIT, EV_KEY);
+
     for (int i = 0; i < num_btns; i++)
     {
         int j = ioctl(fd, UI_SET_KEYBIT, btn_inputs[i]);
-        if (j < 0) printf("Failed to set button input at step %u", i);
+        if (j < 0) printf("[CHILD %i]: Failed to activate button input number %u: %s\n", child_id, i, btn_names[i]);
     }
 
     for (int i = 0; i < num_abs; i++)
     {
         int j = ioctl(fd, UI_SET_ABSBIT, abs_inputs[i]);
-        if (j < 0) printf("Failed to set abs axis input at step %u", i);
+        if (j < 0) printf("[CHILD %i]: Failed to activate absolute axis input number %u: %s\n", child_id, i, abs_names[i]);
+
+        if (abs_inputs[i] == ABS_HAT0Y) {
+            j = set_axis_values(fd, abs_inputs[i], -1, 1, 0, 0);
+        } else {
+            j = set_axis_values(fd, abs_inputs[i], ABS_MIN_VAL, ABS_MAX_VAL, 0, 32);
+        }
+        if (j != 0) printf("[CHILD %i]: Failed to set absolute axis settings for input number %u: %s\n", child_id, i, abs_names[i]);
     }
 
-    set_axis_values(uidev, ABS_X, ABS_MIN_VAL, ABS_MAX_VAL, 0, 0);
-    set_axis_values(uidev, ABS_Y, ABS_MIN_VAL, ABS_MAX_VAL, 0, 0);
-    set_axis_values(uidev, ABS_Z, 0, ABS_MAX_VAL, 0, 0);
-    set_axis_values(uidev, ABS_RX, ABS_MIN_VAL, ABS_MAX_VAL, 0, 0);
-    set_axis_values(uidev, ABS_RY, ABS_MIN_VAL, ABS_MAX_VAL, 0, 0);
-    set_axis_values(uidev, ABS_RZ, 0, ABS_MAX_VAL, 0, 0);
-    set_axis_values(uidev, ABS_HAT0X, -1, 1, 0, 0);
-    set_axis_values(uidev, ABS_HAT0Y, -1, 1, 0, 0);
-
-    write(fd, &uidev, sizeof(uidev));
+    ioctl(fd, UI_DEV_SETUP, &usetup);
     ioctl(fd, UI_DEV_CREATE);
+    char sysfs_device_name[16];
+    ioctl(fd, UI_GET_SYSNAME(sizeof(sysfs_device_name)), sysfs_device_name);
+    printf("[CHILD %i]: UInput virtual device located at /sys/devices/virtual/input/%s\n", child_id, sysfs_device_name);
 
-    sleep(1);
+    // State setups --------------------------------------------------------------------------------
 
-    // MAIN LOOP -----------------------------------------------------------------
-
-    input_obj input1;
+    input_obj inputs;
+    Guitar_Status *status = new Guitar_Status(inputs);
     unsigned char *latest_packet = new unsigned char(22);
-    Guitar_Status *status = new Guitar_Status(input1);
-    wiimote->set_active_leds();
     std::vector<input_diff> diffs;
-    bool spam;
-    bool spamState = false;
+    bool spam = false;
+    bool spam_state = false;
+
+    status->set_calibration_offsets(zero_offs, grav_offs);
+
+    // MAIN LOOP -----------------------------------------------------------------------------------
+
     while (true)
     {
+        // failsafe. If the parent process terminates for any reason then shutdown immediately.
+        if (getppid() == 1) {
+            exit_handler(0);
+            exit(0);
+        }
         wiimote->read_packet(latest_packet);
         status->update(latest_packet, diffs, wiimote);
         diffs.shrink_to_fit();
-        spam = status->getSpamButtons(latest_packet);
+        spam = status->get_spam_buttons(latest_packet);
+
         // The wide char string compare function returns 0 if the values are equal
-        if (hid_error(open_dev) && wcscmp(hid_error(open_dev), L"Success"))
-        {
-            printf("[%i] hid_error: %ls\n", time(NULL), hid_error(open_dev));
-            continue;
-        }
-        // printf("Packet: ");
-        // for (int i = 0; i < 22; i++)
+        // if (hid_error(hid_dev) && wcscmp(hid_error(hid_dev), L"Success"))
         // {
-        //     printf("%02hhx ", latest_packet[i]);
+        //     printf("[CHILD %i]: hid_error: %ls\n", child_id, hid_error(hid_dev));
+        //     continue;
         // }
-        // std::cout << "\n";
 
         if (spam)
         {
-            spamState = !spamState;
-            emit(fd, EV_KEY, BTN_TR, spamState);
+            spam_state = !spam_state;
+            emit(fd, EV_KEY, BTN_TR, spam_state);
         }
-        else if (spamState)
+        else if (spam_state)
         {
-            spamState = false;
+            spam_state = false;
             emit(fd, EV_KEY, BTN_TR, false);
         }
+
+        // Update UInput input states --------------------------------------------------------------
 
         for (int i = 0; i < diffs.size(); i++)
         {
@@ -553,27 +639,102 @@ int main() {
             {
                 int j;
                 // strum_down
-                if (changed_input.id == 5) 
+                if (changed_input.id == 5)
                 {
-                    j = emit(fd, EV_ABS, uinput_map[changed_input.id], changed_input.val_bool.value_or(0));
+                    j = emit(fd, EV_ABS, uinput_map[changed_input.id], changed_input.val_bool);
                 }
                 // strum_up
                 else if (changed_input.id == 6)
                 {
-                    j = emit(fd, EV_ABS, uinput_map[changed_input.id], -1 * changed_input.val_bool.value_or(0));
+                    j = emit(fd, EV_ABS, uinput_map[changed_input.id], -1 * changed_input.val_bool);
                 }
 
-                else j = emit(fd, EV_KEY, uinput_map[changed_input.id], changed_input.val_bool.value_or(false));
+                else {
+                    j = emit(fd, EV_KEY, uinput_map[changed_input.id], changed_input.val_bool);
+                }
             }
             // whammy & tilt
             else if (changed_input.id >= 9)
             {
-                int mapped_val = changed_input.val_float.value_or(0) * ABS_MAX_VAL;
+                int mapped_val = changed_input.val_float * ABS_MAX_VAL;
                 emit(fd, EV_ABS, uinput_map[changed_input.id], mapped_val);
             }
         }
         dev_sync(fd);
     }
-    hid_close(open_dev);
-    delete wiimote;
+}
+
+int main() {
+    hid_init();
+
+    // handling ctrl+c to shutdown properly
+    struct sigaction sig_handler;
+    sigset_t signal_set;
+    sigemptyset(&signal_set);
+
+    sigemptyset(&sig_handler.sa_mask);
+    sig_handler.sa_flags = 0;
+
+    sigaction(SIGINT, &sig_handler, NULL);
+
+    // Get all connected wiimotes ------------------------------------------------------------------
+
+    //TODO: periodically check for wiimotes
+    hid_device_info *devices = hid_enumerate(0x057e, 0x0306);
+
+    hid_device_info *dev = devices;
+    while (dev)
+    {
+        num_devices++;
+        dev = dev->next;
+    }
+
+    if (num_devices < 1)
+    {
+        puts("No connected wiimotes. Shutting down.\n");
+        return 0;
+    }
+
+    child_pids = (pid_t *) calloc(num_devices, sizeof(pid_t));
+
+    // Summon child processes to handle each device ------------------------------------------------
+    for (int i = 0; i < num_devices; i++)
+    {
+        pid_t pid = fork();
+        if (pid == 0)
+        {
+            // block the SIGINT signal (ctrl+c) because only the parent process needs to handle it.
+            sigaddset(&signal_set, SIGINT);
+            sigprocmask(SIG_BLOCK, &signal_set, NULL);
+
+            sig_handler.sa_handler = exit_handler;
+            sigaction(SIGUSR1, &sig_handler, NULL);
+            child_exec(i + 1, devices->path);
+            return 0; //failsafe. if child_exec (a.k.a. the main loop) ever returns then just stop the process.
+        }
+        else
+        {
+            child_pids[i] = pid;
+            devices = devices->next;
+        }
+    }
+    hid_free_enumeration(devices);
+
+    sig_handler.sa_handler = terminate_children;
+    sigaction(SIGINT, &sig_handler, NULL);
+
+    bool all_exited = false;
+    while (!all_exited)
+    {
+        all_exited = true;
+        for (int i = 0; i < num_devices; i++)
+        {
+            if (waitpid(child_pids[i], nullptr, WNOHANG) == 0)
+            {
+                all_exited = false;
+                break;
+            }
+        }
+    }
+    hid_exit();
 } 
